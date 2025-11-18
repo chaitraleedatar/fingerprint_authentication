@@ -7,6 +7,7 @@ This module implements various preprocessing techniques for fingerprint images:
 - Normalization (intensity normalization)
 - Ridge enhancement (Gabor filtering)
 - Binarization (optional)
+- Thinning/Skeletonization (extract 1-pixel wide ridges)
 """
 
 import numpy as np
@@ -244,12 +245,120 @@ def binarize_image(image: np.ndarray, method: str = 'adaptive',
     return binary
 
 
-def preprocess_pipeline(image: np.ndarray, 
+def skeletonize(binary_image: np.ndarray) -> np.ndarray:
+    """
+    Skeletonize binary image to get clean 1-pixel wide ridges.
+    
+    Uses scikit-image's skeletonize function which implements Zhang-Suen algorithm.
+    This produces clean, reliable thinning without circles or artifacts.
+    
+    Args:
+        binary_image: Binary fingerprint image (255 = ridge, 0 = valley)
+        
+    Returns:
+        Skeletonized/thinned image (255 = ridge, 0 = background)
+    """
+    try:
+        from skimage.morphology import skeletonize as sk_skeletonize
+    except ImportError:
+        raise ImportError("scikit-image is required. Install with: pip install scikit-image")
+    
+    # Ensure ridges are white (255) and background is black (0)
+    if np.mean(binary_image) < 127:
+        binary_image = 255 - binary_image
+    
+    # Convert to boolean (True = ridge, False = valley)
+    # scikit-image expects True for foreground (ridges)
+    binary = (binary_image > 127).astype(bool)
+    
+    # Use scikit-image's skeletonize (Zhang-Suen algorithm)
+    skeleton = sk_skeletonize(binary)
+    
+    # Very light cleanup: Only remove isolated single pixels (no neighbors)
+    skeleton = _remove_isolated_pixels(skeleton)
+    
+    # Convert back to uint8 (255 = ridge, 0 = background)
+    return (skeleton.astype(np.uint8) * 255)
+
+
+def _disconnect_junctions(skeleton: np.ndarray) -> np.ndarray:
+    """
+    Disconnect unwanted connections at junction points.
+    Removes pixels that have 3 or more neighbors (junctions) to break connections.
+    
+    Args:
+        skeleton: Boolean skeleton image
+        
+    Returns:
+        Skeleton with some junctions disconnected
+    """
+    cleaned = skeleton.copy()
+    h, w = skeleton.shape
+    
+    # Find junction points (pixels with 3+ neighbors) and remove some to disconnect
+    for i in range(2, h - 2):
+        for j in range(2, w - 2):
+            if not cleaned[i, j]:
+                continue
+            
+            # Count 8-connected neighbors
+            neighbors = [
+                cleaned[i-1, j-1], cleaned[i-1, j], cleaned[i-1, j+1],
+                cleaned[i, j-1],                     cleaned[i, j+1],
+                cleaned[i+1, j-1], cleaned[i+1, j], cleaned[i+1, j+1]
+            ]
+            neighbor_count = sum(neighbors)
+            
+            # If it's a junction (3+ neighbors), check if it should be disconnected
+            # Remove if it has 4 or more neighbors (likely unwanted connection)
+            if neighbor_count >= 4:
+                cleaned[i, j] = False
+    
+    return cleaned
+
+
+def _remove_isolated_pixels(skeleton: np.ndarray) -> np.ndarray:
+    """
+    Remove only completely isolated pixels (no neighbors at all).
+    This is a very gentle cleanup that only removes scattered noise points.
+    
+    Args:
+        skeleton: Boolean skeleton image
+        
+    Returns:
+        Cleaned skeleton with isolated pixels removed
+    """
+    cleaned = skeleton.copy()
+    h, w = skeleton.shape
+    
+    # Remove pixels with zero neighbors (completely isolated)
+    for i in range(1, h - 1):
+        for j in range(1, w - 1):
+            if not cleaned[i, j]:
+                continue
+            
+            # Count 8-connected neighbors
+            neighbors = [
+                cleaned[i-1, j-1], cleaned[i-1, j], cleaned[i-1, j+1],
+                cleaned[i, j-1],                     cleaned[i, j+1],
+                cleaned[i+1, j-1], cleaned[i+1, j], cleaned[i+1, j+1]
+            ]
+            neighbor_count = sum(neighbors)
+            
+            # Remove only if completely isolated (0 neighbors)
+            if neighbor_count == 0:
+                cleaned[i, j] = False
+    
+    return cleaned
+
+
+def preprocess_pipeline(image: np.ndarray,
                        normalize: bool = True,
                        denoise: bool = True,
                        enhance_contrast: bool = True,
                        enhance_ridges: bool = False,
                        binarize: bool = False,
+                       thin: bool = False,
                        **kwargs) -> np.ndarray:
     """
     Complete preprocessing pipeline for fingerprint images.
@@ -261,10 +370,12 @@ def preprocess_pipeline(image: np.ndarray,
         enhance_contrast: Whether to enhance contrast (uses CLAHE)
         enhance_ridges: Whether to enhance ridges using Gabor filter
         binarize: Whether to binarize the image
+        thin: Whether to apply thinning/skeletonization (requires binarize=True)
+             This creates 1-pixel wide ridges (line-only image)
         **kwargs: Additional parameters for specific preprocessing steps
         
     Returns:
-        Preprocessed image
+        Preprocessed image (if thin=True, returns skeletonized/thinned image)
     """
     processed = image.copy()
     
@@ -297,12 +408,16 @@ def preprocess_pipeline(image: np.ndarray,
         sigma_y = kwargs.get('gabor_sigma_y', 4.0)
         processed = enhance_gabor_filter(processed, frequency, orientation, sigma_x, sigma_y)
     
-    # Step 5: Binarization (optional)
-    if binarize:
+    # Step 5: Binarization (required for thinning)
+    if thin or binarize:
         method = kwargs.get('binarize_method', 'adaptive')
         block_size = kwargs.get('binarize_block_size', 11)
         c = kwargs.get('binarize_c', 2)
         processed = binarize_image(processed, method, block_size, c)
+    
+    # Step 6: Thinning/Skeletonization (optional)
+    if thin:
+        processed = skeletonize(processed)
     
     return processed
 
@@ -316,7 +431,9 @@ def save_image(image: np.ndarray, output_path: str) -> None:
         output_path: Path where to save the image
     """
     # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:  # Only create directory if path contains a directory
+        os.makedirs(output_dir, exist_ok=True)
     
     cv2.imwrite(output_path, image)
 
