@@ -342,263 +342,143 @@ def binarize_adaptive(image: np.ndarray, orientation_field: np.ndarray,
 def skeletonize(binary_image: np.ndarray) -> np.ndarray:
     """
     Skeletonize binary image to get 1-pixel wide ridges.
-    Uses Zhang-Suen thinning algorithm for clean lines.
+    Uses morphological operations for thinning.
     
     Args:
         binary_image: Binary fingerprint image (255 = ridge, 0 = valley)
         
     Returns:
-        Skeletonized image (clean 1-pixel wide lines)
+        Skeletonized image
     """
-    # Import from preprocessing to use the same algorithm
-    from preprocessing import skeletonize as preprocess_skeletonize
-    return preprocess_skeletonize(binary_image)
-
-
-def has_adjacent_ridges_on_both_sides(binary: np.ndarray, i: int, j: int, 
-                                     orientation: float, check_distance: int = 5) -> bool:
-    """
-    Check if a minutiae point has adjacent ridges on both sides.
+    # Convert to binary (0 or 1)
+    skeleton = (binary_image > 127).astype(np.uint8)
     
-    Based on the heuristic: "minutiae that do not have an adjacent ridge on either side
-    (mainly the endpoints of ridges along the finger border)" should be removed.
+    # Use morphological thinning with hit-or-miss transform
+    # This is a simplified version - for better results, use Zhang-Suen algorithm
+    kernel = np.ones((3, 3), np.uint8)
     
-    Args:
-        binary: Binary skeleton image
-        i, j: Pixel coordinates
-        orientation: Ridge orientation at this point
-        check_distance: Distance to check for adjacent ridges
+    # Iterative thinning
+    prev = np.zeros_like(skeleton)
+    while not np.array_equal(skeleton, prev):
+        prev = skeleton.copy()
         
-    Returns:
-        True if ridges exist on both sides, False otherwise
-    """
-    h, w = binary.shape
-    
-    # Calculate perpendicular direction to the ridge
-    perp_angle = orientation + np.pi / 2
-    
-    # Check on both sides perpendicular to the ridge
-    cos_perp = np.cos(perp_angle)
-    sin_perp = np.sin(perp_angle)
-    
-    # Check left side
-    left_has_ridge = False
-    for d in range(1, check_distance + 1):
-        check_i = int(i + d * sin_perp)
-        check_j = int(j + d * cos_perp)
+        # Erode with small kernel
+        skeleton = cv2.erode(skeleton, kernel, iterations=1)
         
-        if 0 <= check_i < h and 0 <= check_j < w:
-            if binary[check_i, check_j] > 0:
-                left_has_ridge = True
+        # Reconstruct using dilation
+        marker = skeleton.copy()
+        mask = (binary_image > 127).astype(np.uint8)
+        for _ in range(10):  # Limited iterations
+            marker = cv2.dilate(marker, kernel, iterations=1)
+            marker = cv2.bitwise_and(marker, mask)
+            if np.array_equal(marker, skeleton):
                 break
+            skeleton = marker
     
-    # Check right side
-    right_has_ridge = False
-    for d in range(1, check_distance + 1):
-        check_i = int(i - d * sin_perp)
-        check_j = int(j - d * cos_perp)
-        
-        if 0 <= check_i < h and 0 <= check_j < w:
-            if binary[check_i, check_j] > 0:
-                right_has_ridge = True
-                break
-    
-    # Return True only if ridges exist on BOTH sides
-    return left_has_ridge and right_has_ridge
+    return skeleton * 255
 
 
 def extract_minutiae(skeleton: np.ndarray, orientation_field: np.ndarray,
-                    min_distance: int = 20,
-                    remove_border_false_positives: bool = True) -> List[Minutiae]:
+                    min_distance: int = 10) -> List[Minutiae]:
     """
-    Extract minutiae points from skeletonized image using Crossing Number method.
-    
-    Crossing Number is defined as half of the sum of differences between intensity 
-    values of two adjacent pixels (in the 8-neighborhood).
-    
-    Classification:
-    - Crossing Number = 1: Termination (ridge ending)
-    - Crossing Number = 2: Normal ridge pixel (not a minutiae)
-    - Crossing Number = 3 or >3: Bifurcation
-    
-    Note: Terminations at outer boundaries are not considered minutiae points.
+    Extract minutiae points from skeletonized image.
     
     Args:
-        skeleton: Skeletonized binary image (thinned, 1-pixel wide ridges)
+        skeleton: Skeletonized binary image
         orientation_field: Ridge orientation field
         min_distance: Minimum distance between minutiae points
-        remove_border_false_positives: If True, remove minutiae without adjacent ridges on both sides
         
     Returns:
-        List of Minutiae objects (with false positives removed)
+        List of Minutiae objects
     """
     # Convert to binary (0 or 1)
     binary = (skeleton > 0).astype(np.uint8)
     
+    # Use 3x3 cross pattern to detect minutiae
+    # Ridge ending: pixel with exactly 1 neighbor
+    # Bifurcation: pixel with exactly 3 neighbors
+    
     h, w = binary.shape
     minutiae = []
     
-    # 8-connected neighbors in clockwise order
-    # Starting from top-left, going clockwise
+    # 8-connected neighbors
     neighbors = [(-1, -1), (-1, 0), (-1, 1),
-                (0, 1),   (1, 1),  (1, 0),
-                (1, -1),  (0, -1)]
-    
-    # Also include the first neighbor at the end to form a closed loop
-    neighbors_loop = neighbors + [neighbors[0]]
+                (0, -1),           (0, 1),
+                (1, -1),  (1, 0),  (1, 1)]
     
     for i in range(1, h - 1):
         for j in range(1, w - 1):
-            if binary[i, j] == 0:  # Skip background pixels
+            if binary[i, j] == 0:  # Skip background
                 continue
             
-            # Calculate Crossing Number
-            # CN = 0.5 * sum of |P_i - P_{i+1}| for i=0 to 7
-            # where P_i are the 8 neighbors in order
-            crossing_number = 0
-            neighbor_values = []
-            
-            # Get neighbor values in order (as integers, not uint8 to avoid overflow)
+            # Count neighbors
+            neighbor_count = 0
             for di, dj in neighbors:
-                neighbor_values.append(int(binary[i + di, j + dj]))
+                if binary[i + di, j + dj] > 0:
+                    neighbor_count += 1
             
-            # Calculate sum of differences between adjacent neighbors
-            # Add the last-to-first difference to close the loop
-            for idx in range(len(neighbors)):
-                next_idx = (idx + 1) % len(neighbors)
-                diff = abs(neighbor_values[idx] - neighbor_values[next_idx])
-                crossing_number += diff
-            
-            # Crossing Number = half of the sum
-            crossing_number = crossing_number // 2
-            
-            # Classify based on Crossing Number
-            orientation = orientation_field[i, j]
-            
-            if crossing_number == 1:
-                # Termination (ridge ending)
-                m = Minutiae(j, i, orientation, 'ending')
-            elif crossing_number >= 3:
-                # Bifurcation (or higher order junction)
-                m = Minutiae(j, i, orientation, 'bifurcation')
-            else:
-                # Crossing Number = 2: Normal ridge pixel, not a minutiae
-                continue
-            
-            # Apply heuristic: remove if no adjacent ridges on both sides
-            # This removes false positives at finger borders
-            if remove_border_false_positives:
-                if not has_adjacent_ridges_on_both_sides(binary, i, j, orientation):
-                    continue  # Skip this false positive
-            
-            minutiae.append(m)
+            # Detect minutiae
+            if neighbor_count == 1:
+                # Ridge ending
+                orientation = orientation_field[i, j]
+                minutiae.append(Minutiae(j, i, orientation, 'ending'))
+            elif neighbor_count == 3:
+                # Bifurcation
+                orientation = orientation_field[i, j]
+                minutiae.append(Minutiae(j, i, orientation, 'bifurcation'))
     
     # Remove minutiae that are too close to each other
-    # Use a more robust filtering method that handles dense regions better
-    filtered_minutiae = _filter_minutiae_by_distance(minutiae, min_distance)
+    filtered_minutiae = []
+    for m in minutiae:
+        too_close = False
+        for existing in filtered_minutiae:
+            distance = np.sqrt((m.x - existing.x)**2 + (m.y - existing.y)**2)
+            if distance < min_distance:
+                too_close = True
+                break
+        if not too_close:
+            filtered_minutiae.append(m)
     
     return filtered_minutiae
 
 
-def _filter_minutiae_by_distance(minutiae: List[Minutiae], min_distance: float) -> List[Minutiae]:
-    """
-    Filter minutiae to ensure minimum distance between points.
-    
-    Uses a greedy approach with improved handling of dense regions:
-    1. Sort by quality (endings preferred, then by position)
-    2. For each minutia, check distance to all already kept minutiae
-    3. In dense regions, only the first (highest quality) minutia is kept
-    
-    This helps reduce dense clusters while preserving important minutiae.
-    
-    Args:
-        minutiae: List of Minutiae objects
-        min_distance: Minimum distance between minutiae points (in pixels)
-        
-    Returns:
-        Filtered list of Minutiae objects
-    """
-    if len(minutiae) == 0:
-        return []
-    
-    # Sort minutiae by quality:
-    # 1. Endings are generally more reliable than bifurcations
-    # 2. Then by position (for deterministic ordering)
-    def sort_key(m: Minutiae) -> Tuple[int, int, int]:
-        # Prefer endings (type 'ending' = 0) over bifurcations (type 'bifurcation' = 1)
-        type_priority = 0 if m.type == 'ending' else 1
-        return (type_priority, m.y, m.x)
-    
-    sorted_minutiae = sorted(minutiae, key=sort_key)
-    
-    filtered = []
-    min_distance_sq = min_distance * min_distance  # Use squared distance for efficiency
-    
-    for m in sorted_minutiae:
-        too_close = False
-        for existing in filtered:
-            # Calculate squared distance (avoid sqrt for efficiency)
-            dx = m.x - existing.x
-            dy = m.y - existing.y
-            dist_sq = dx * dx + dy * dy
-            
-            if dist_sq < min_distance_sq:
-                too_close = True
-                break
-        
-        if not too_close:
-            filtered.append(m)
-    
-    return filtered
-
-
 def extract_features(image: np.ndarray, 
                     block_size: int = 16,
-                    min_distance: int = 20,
-                    is_thinned: bool = False,
-                    remove_border_false_positives: bool = True) -> Dict:
+                    min_distance: int = 10) -> Dict:
     """
     Complete feature extraction pipeline.
     
     Args:
-        image: Preprocessed grayscale fingerprint image (or thinned image if is_thinned=True)
+        image: Preprocessed grayscale fingerprint image
         block_size: Block size for orientation/frequency estimation
         min_distance: Minimum distance between minutiae points
-        is_thinned: If True, image is already thinned/skeletonized (skip steps 3-5)
-        remove_border_false_positives: If True, remove minutiae without adjacent ridges on both sides
         
     Returns:
         Dictionary containing:
             - orientation_field: Ridge orientation field
             - frequency_field: Ridge frequency field
-            - enhanced_image: Gabor-enhanced image (or None if is_thinned)
-            - binary_image: Binarized image (or thinned image if is_thinned)
-            - skeleton: Skeletonized image (same as input if is_thinned)
-            - minutiae: List of Minutiae objects (with false positives removed)
+            - enhanced_image: Gabor-enhanced image
+            - binary_image: Binarized image
+            - skeleton: Skeletonized image
+            - minutiae: List of Minutiae objects
     """
-    # Step 1: Estimate orientation field (always needed)
+    # Step 1: Estimate orientation field
     orientation_field = estimate_orientation_field(image, block_size)
     
-    # Step 2: Estimate ridge frequency (always needed)
+    # Step 2: Estimate ridge frequency
     frequency_field = estimate_ridge_frequency(image, orientation_field, block_size)
     
-    if is_thinned:
-        # Image is already thinned, skip enhancement, binarization, and skeletonization
-        skeleton = image.copy()
-        binary_image = image.copy()
-        enhanced_image = None
-    else:
-        # Step 3: Enhance ridges using Gabor filters
-        enhanced_image = enhance_ridges_gabor(image, orientation_field, frequency_field, block_size)
-        
-        # Step 4: Binarize
-        binary_image = binarize_adaptive(enhanced_image, orientation_field, block_size)
-        
-        # Step 5: Skeletonize
-        skeleton = skeletonize(binary_image)
+    # Step 3: Enhance ridges using Gabor filters
+    enhanced_image = enhance_ridges_gabor(image, orientation_field, frequency_field, block_size)
     
-    # Step 6: Extract minutiae (always needed, with false positive removal)
-    minutiae = extract_minutiae(skeleton, orientation_field, min_distance, remove_border_false_positives)
+    # Step 4: Binarize
+    binary_image = binarize_adaptive(enhanced_image, orientation_field, block_size)
+    
+    # Step 5: Skeletonize
+    skeleton = skeletonize(binary_image)
+    
+    # Step 6: Extract minutiae
+    minutiae = extract_minutiae(skeleton, orientation_field, min_distance)
     
     return {
         'orientation_field': orientation_field,
