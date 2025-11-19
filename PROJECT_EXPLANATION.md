@@ -186,66 +186,82 @@ These points are unique to each person and don't change over time!
 
 ---
 
-## Step 3: ENROLLMENT & MATCHING (To be implemented)
+## Step 3: ENROLLMENT & MATCHING
+
+### Files Involved:
+- **`enrollment.py`** – Generates templates from training images and stores them as JSON
+- **`matching.py`** – Loads templates and compares query fingerprints against them
+- **`database/templates/`** – Output directory for stored templates (gitignored)
 
 ### Enrollment - What is it?
-**Storing fingerprint features in a database** for later comparison.
+**Storing fingerprint minutiae features in a reusable template** for each person.
 
-### What we'll do:
-1. Process multiple images of the same person (from training set)
-2. Extract features from each image
-3. Create a "template" combining all features
-4. Store in database with person ID
+### How it works (in `enrollment.py`):
+1. For each person, we gather their training images (`project-data/Project-Data/train/YYY_R0_{0,1,2}.bmp`)
+2. Each image is preprocessed and passed through feature extraction
+3. The minutiae vectors are converted to JSON-friendly records (x, y, orientation, type)
+4. All records are combined into a single template (`database/templates/YYY.json`) with metadata (image count, minutiae stats, centroid)
 
 ### Matching - What is it?
-**Comparing a new fingerprint against stored ones** to identify the person.
+**Comparing a new fingerprint against the enrolled templates** to identify the person.
 
-### What we'll do:
-1. Process the new fingerprint (preprocessing + feature extraction)
-2. Align it with stored templates (rotation/translation)
-3. Match minutiae points between new and stored
-4. Calculate similarity score
-5. Make decision: Match or No Match
+### How it works (in `matching.py`):
+1. Load templates (minutiae arrays) into memory
+2. Process the query fingerprint (preprocess + feature extract)
+3. Center both template and query minutiae around their centroids to handle translation
+4. Greedily match minutiae pairs within distance/orientation thresholds (optionally enforcing same type)
+5. Calculate a similarity score = matched pairs / max(template_size, query_size)
+6. If score ≥ threshold (default 0.4) → Match; otherwise → No Match
 
-### Theory:
-- **Alignment:** Fingerprints can be rotated/translated, so we need to align them first
-- **Matching:** Compare minutiae locations, orientations, and types
-- **Scoring:** Count how many minutiae match (within tolerance)
-- **Threshold:** If score > threshold → Match, else → No Match
+### CLI Examples:
+```bash
+# Enroll everyone in the training set
+python enrollment.py --train-dir project-data/Project-Data/train --template-dir database/templates
+
+# Match a validation fingerprint against enrolled templates
+python matching.py project-data/Project-Data/validate/000_R0_3.bmp --template-dir database/templates --threshold 0.4
+```
 
 ---
 
-## Step 4: EVALUATION (To be implemented)
+## Step 4: EVALUATION
+
+### Files Involved:
+- **`evaluation.py`** – Runs benchmark on validation/test sets, saves metrics + plots
+- **`evaluation_output/`** – Stores JSON/TXT summaries and metric charts (gitignored)
 
 ### What is it?
-**Measuring how well the system works** using metrics.
+**Measuring how well the system works** using standard biometrics metrics.
 
-### Metrics we'll calculate:
+### Metrics we calculate (in `evaluation.py`):
+1. **Accuracy** – Overall correctness across all attempts
+2. **False Acceptance Rate (FAR)** – Impostors incorrectly accepted (lower is better)
+3. **False Rejection Rate (FRR)** – Genuine users incorrectly rejected (lower is better)
 
-1. **False Acceptance Rate (FAR)**
-   - How often system says "Match" when it shouldn't
-   - Lower is better
-   - Example: FAR = 0.1% means 1 in 1000 wrong matches
+> *Equal Error Rate (EER) can be approximated by sweeping thresholds; FAR/FRR give the necessary data points.*
 
-2. **False Rejection Rate (FRR)**
-   - How often system says "No Match" when it should match
-   - Lower is better
-   - Example: FRR = 1% means 1 in 100 correct matches rejected
+### How it works:
+1. Load templates from `database/templates/`
+2. For each query image (validation/test), preprocess + extract minutiae
+3. Run `matching.identify()` to get predicted ID + similarity score
+4. Compare predicted ID vs actual ID (from filename) to classify outcomes:
+   - Genuine attempt (ID enrolled) vs impostor attempt (new ID)
+   - Count true accepts, false rejects, true rejects, false accepts
+5. Compute metrics and save:
+   - `{dataset}_results.json` – Per-image predictions and scores
+   - `{dataset}_metrics.txt` – Human-readable summary
+   - `{dataset}_metrics.png` – Bar chart (Accuracy, FAR, FRR)
 
-3. **Equal Error Rate (EER)**
-   - Point where FAR = FRR
-   - Lower is better (indicates better system)
-   - Typical good system: EER < 5%
+### CLI Example:
+```bash
+# Evaluate on validation set
+python evaluation.py --template-dir database/templates \
+  --query-dir project-data/Project-Data/validate --threshold 0.4
 
-4. **ROC Curve**
-   - Graph showing FAR vs FRR at different thresholds
-   - Shows trade-off between security and convenience
-
-### What we'll do:
-1. Test on validation set (tune parameters)
-2. Test on test set (final evaluation)
-3. Calculate all metrics
-4. Create visualizations (ROC curve, confusion matrix)
+# Evaluate on test set (after tuning on validation)
+python evaluation.py --template-dir database/templates \
+  --query-dir project-data/Project-Data/test --threshold 0.4
+```
 
 ---
 

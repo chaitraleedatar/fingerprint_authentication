@@ -1,3 +1,8 @@
 Project-Data/
 Project-Data.zip
 ProjectDocument.pdf
+preprocessed_output/
+feature_output/
+__pycache__/
+database/
+evaluation_output/
